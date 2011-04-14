@@ -1,5 +1,4 @@
 #define FASTADC 1
-
 // defines for setting and clearing register bits, which we use to make the adc take 11us vs 150us; stupid ardunio peeps.
 
 #ifndef cbi
@@ -8,6 +7,16 @@
 #ifndef sbi
 #define sbi(sfr, bit) (_SFR_BYTE(sfr) |= _BV(bit))
 #endif
+
+//position storage variables
+volatile long xpos;
+volatile long ypos;
+volatile long zpos;
+
+//encoder z-axis state change variable
+volatile int zchange;
+//toggle variable to generate motor drive square wave
+volatile boolean ztoggle;
 
 //pin assignments
 //joystick x
@@ -52,38 +61,42 @@ int ylowlimit = 16;
 int yhighlimit = 17;
 
 //Joystick calibration values
-int ydeadlow = 330;
-int ydeadhigh = 345;
-int ylow = 10;
-int yhigh = 506;
-
 int xdeadlow = 330;
 int xdeadhigh = 345;
 int xlow = 10;
 int xhigh = 506;
+float xlowscale = (float(xdeadlow) - float(xlow))/50.0;
+float xhighscale = (float(xhigh) - float(xdeadhigh))/50.0;
 
-//stage translation speed constants
-int xslowprescale = 128; //clock divider for PWM in slow translation mode
-int xfastprescale = 4; //clock divider for PWM in fast translation mode
-int yslowprescale = 128; //clock divider for PWN in slow translation mode
-int yfastprescale = 4; //clock divider for PWM in fast translation mode
+int ydeadlow = 330;
+int ydeadhigh = 345;
+int ylow = 10;
+int yhigh = 506;
+float ylowscale = (float(ydeadlow) - float(ylow))/50.0;
+float yhighscale = (float(yhigh) - float(ydeadhigh))/50.0;
+
+//stage translation speed constants for setting up PWM
+byte axismoveon; //TCCRnA value to enable motion
+byte axismoveoff;//TCCRnA value to disable motion
+byte axisfastmove; //TCCRnB value to move fast
+byte axisslowmove; //TCCRnB value to move slow
 
 void setup() {
   Serial.begin(115200); // for debug?
-  
+
   // setup io lines...
   pinMode(xjoypin, INPUT);
   pinMode(yjoypin, INPUT);
   pinMode(joybuttonpin, INPUT);
   digitalWrite(joybuttonpin, HIGH); //enable pullup resistor
-  
+
   pinMode(zencpinA, INPUT);
   digitalWrite(zencpinA, HIGH); //enable pullup resistor
   pinMode(zencpinB, INPUT);
   digitalWrite(zencpinB, HIGH); //enable pullup resistor
   pinMode(zencsw, INPUT);
   digitalWrite(zencsw, HIGH); //enable pullup resistor
-  
+
   pinMode(preset1, INPUT);
   digitalWrite(preset1, HIGH); //enable pullup resistor
   pinMode(preset1led, OUTPUT);
@@ -93,10 +106,10 @@ void setup() {
   pinMode(preset3, INPUT);
   digitalWrite(preset3, HIGH); //enablepullup resistor
   pinMode(preset3led, OUTPUT);
-  
+
   pinMode(pushsw, INPUT);
   digitalWrite(pushsw, HIGH); //enable pullup resistor
-  
+
   pinMode(pinxdir, OUTPUT);
   pinMode(pinxstep, OUTPUT);//PWM T3A
 
@@ -106,134 +119,272 @@ void setup() {
   pinMode(pinzdir, OUTPUT); //no PWM here, triggered solely via interrupt
   pinMode(pinzstep, OUTPUT);
 
+  pinMode(xlowlimit, INPUT); 
+  pinMode(xhighlimit, INPUT);
+  pinMode(ylowlimit, INPUT);
+  pinMode(yhighlimit, INPUT);
+
   // speed up the adc...
 
-  #if FASTADC
-    // set prescale to 16
-    sbi(ADCSRA,ADPS2) ;
-    cbi(ADCSRA,ADPS1) ;
-    cbi(ADCSRA,ADPS0) ;
-  #endif
+#if FASTADC
+  // set prescale to 16
+  sbi(ADCSRA,ADPS2) ;
+  cbi(ADCSRA,ADPS1) ;
+  cbi(ADCSRA,ADPS0) ;
+#endif
+
+  //TCCRnA - set [7]COMnA1 = 0, [6]COMnA0 = 1, [1]WGMn1 = 0, [0]WGMn0 = 0
+  //(COM) - set to toggle OCnA on compare match, (WGM) - set CTC
+  axismoveon  = B01000000;
+  //TCCRnA - set [7]COMnA1 = 0, [6]COMnA0 = 0, [1]WGMn1 = 0, [0]WGMn0 = 0
+  //(COM) - set to diable OCnA toggle, (WGM) - set CTC
+  axismoveoff = B00000000;
+  TCCR3A = axismoveoff; //disable x axis motion by default
+  TCCR4A = axismoveoff; //disable y axis motion by default
+  TCCR5A = axismoveoff; //timer 5 set to be just CTC timer, no output
+
+  //TCCRnB - set [4]WGMn3 = 0, [3]WGMn2 = 1, [2]CSn2 = 1, [1]CSn1 = 0, [0]CSn0 = 0
+  //(WGM) - set to CTC, (CS) - clock prediv = 256
+  //if OCRnx is set to 65535, timer overflows once every ~.95 seconds
+  //therefore OCnx pin has a rising edge every ~1.9 seconds
+  axisslowmove = B00001100;
+
+  //TCCRnB - set [4]WGMn3 = 0, [3]WGMn2 = 1, [2]CSn2 = 0, [1]CSn1 = 1, [0]CSn0 = 0
+  //(WGM) - set to CTC, (CS) - clock prediv = 8
+  //if OCRnx is set to 65535, timer overflows ~30.5 times a second
+  //therefore OCnx pin has a rising edge ~15.3 times a second  
+  axisfastmove = B00001010;
+
+  TCCR3B = axisslowmove; //set Y axis to slow speed by default
+  TCCR4B = axisslowmove; //set Y axis to slow speed by default
+  
+  TCCR5B = B00001011; //gives decent prediv (/64) range for timer clocks  
+  
+  cli(); //disable interrupts to safely change 16 bit OCRnx values
+  OCR5A = 63; //gives approx 2 kHz clock rate
+  OCR5B = 6250; //gives approx 20 Hz clock rate
+  //renable interrupts
+  sei();
+  
+  //OCRnA values to control PWM rates is set in readjoystick()
+
+  attachInterrupt(0, Aint, CHANGE);
+  attachInterrupt(1, Bint, CHANGE);
 }
 
-void loop() {
-  unsigned long mainloopstartime = micros();
-  unsigned long debugtiming = micros();  // todo: move these up above? do they get set each main loop or what? 
+void loop() 
+{
 
+}
 
-  // replace these two with spi calls to ian... 
-  
-  if (xjoycal > 2) {
-    if (xdelay < mainloopstartime - xdelay_last) {
-      xdelay_last = mainloopstartime;
-      //pulse the line...
-      digitalWrite(pinxstep, 1^digitalRead(pinxstep));
-      digitalWrite(pinxdir,xjoydir);
-      if (xjoydir == 1) {
-         xsteps++;
-      } else { 
-        xsteps--; 
-      }
+void readjoystick()
+{
+  int joyx, joyy, joybuttonpressed;
+  int tempxreg, tempyreg;
+  unsigned char sreg;
+
+  joyx = analogRead(xjoypin);
+  joyy = analogRead(yjoypin);
+
+  scalemovement(&joyx, &joyy);
+
+  //if joystick is in dead zone, stop movement
+  if (joyx == 0)
+    TCCR3A = axismoveoff;
+  else TCCR3A = axismoveon;
+
+  if (joyy ==0)
+    TCCR4A = axismoveoff;
+  else TCCR4A = axismoveon;
+
+  //set movement direction, stop movement if at limit switches
+  if(joyx<0)
+  {
+    digitalWrite(pinxdir, 0);
+    if(digitalRead(xlowlimit) == LOW)
+      TCCR3A = axismoveoff;
+  }
+  else
+  {
+    digitalWrite(pinxdir, 1);
+    if(digitalRead(xhighlimit) == LOW)
+      TCCR3A = axismoveoff;
+  }
+
+  if(joyy<0)
+  {
+    digitalWrite(pinydir, 0);
+    if(digitalRead(ylowlimit) == LOW)
+      TCCR4A = axismoveoff;
+  }
+  else
+  {
+    digitalWrite(pinydir, 1);
+    if(digitalRead(yhighlimit) == LOW)
+      TCCR4A = axismoveoff;
+  }
+
+  //convert scaled joystick data to PWM control register data
+  tempxreg = scalePWM(joyx);
+  tempyreg = scalePWM(joyy);
+
+  //disable interrputs and update the OCRnA registers to adjust PWM speed
+  cli();
+  OCR3A = tempxreg;
+  OCR4A = tempyreg;
+  //renable interrupts
+  sei();
+
+  joybuttonpressed = digitalRead(joybuttonpin);
+
+  if(joybuttonpressed == 0)
+  {
+    TCCR3B = axisslowmove;
+    TCCR4B = axisslowmove;
+  }
+  else 
+  {
+    TCCR3B = axisfastmove;
+    TCCR4B = axisfastmove;
+  }
+}
+
+void scalemovement(int *joyx, int *joyy)
+{ //arbitrary mapping of joystick input values to ranked value ranks
+  if(*joyx < xdeadlow)
+  {
+    *joyx -= xdeadlow;
+    *joyx /= xlowscale;
+  }  
+  if((*joyx > xdeadlow)&&(*joyx < xdeadhigh))
+    *joyx = 0;
+  if(*joyx > xdeadhigh)
+  {
+    *joyx -= xdeadhigh;
+    *joyx /= xhighscale;
+  }
+
+  if(*joyy < ydeadlow)
+  {
+    *joyy -= ydeadlow;
+    *joyy /= ylowscale;
+  }  
+  if((*joyy > ydeadlow)&&(*joyy < ydeadhigh))
+    *joyy = 0;
+  if(*joyy > ydeadhigh)
+  {
+    *joyy -= ydeadhigh;
+    *joyy /= yhighscale;
+  }
+}
+
+int scalePWM(int rank)
+{
+  return 32768/abs(rank);
+}
+
+ISR(TIM3_COMPA)
+{ //x-axis tally
+  if(PINE3) //if x-step has gone high
+  {
+    if(PING5) //increment or decrement x counter depending on step direction
+      xpos++;
+    else
+      xpos--;
+  }
+}
+
+ISR(TIM4_COMPA)
+{ //y-axis tally
+  if(PINH3) //if y-step has gone high
+  {
+    if(PINH4) //increment or decrement y counter depending on step direction
+      ypos++;
+    else
+      ypos--;
+  }
+}
+
+ISR(TIM5_COMPA)
+{ //fast-tick timer, 2 kHz
+  if(ztoggle == 0)
+  {
+    ztoggle = 1;
+    if(zchange >= 0)
+    { //if + z movement is queued up, move up, keep track of movement
+      zchange --;
+      zpos ++;
+      //set E4 dir line to go up
+      //rising edge to step line E5
+      PORTE = PORTE|B00110000;
+    }
+    if(zchange <= 0)
+    { //if -z movement queued up, move down, keep track of movement
+      zchange ++;
+      zpos --;
+      PORTE = PORTE|B00100000;  //rising edge to step line E5
+      PORTE = PORTE&B11101111; //set E4 dir line to go down
     }
   }
-
-  if (yjoycal > 2) {
-    if (ydelay < mainloopstartime - ydelay_last) {
-      ydelay_last = mainloopstartime;
-      //pulse the line...
-      digitalWrite(pinystep, 1^digitalRead(pinystep));
-      digitalWrite(pinydir,yjoydir);
-      if (yjoydir == 1) {
-         ysteps++;
-      } else { 
-        ysteps--; 
-      }
-    }
+  if(ztoggle == 1) 
+  {
+    PORTE = PORTE&B11011111; //falling edge to step line E5
   }
-           
-  if (serial_update < mainloopstartime - serial_update_last) {
-    serial_update_last = mainloopstartime;
-    tweet(); // takes 256 us
-  }  
-  else if (screendata_update < mainloopstartime - screendata_update_last) {
-    screendata_update_last = mainloopstartime;
-    twitter(); // takes 300? us
-  }  
+}
 
-  else if (analog_read < mainloopstartime - analog_read_last) {
-    analog_read_last = mainloopstartime;
-    readjoydata(); // takes under 256 us.
-    calcstepperdelay();
+ISR(TIM5_COMPB)
+{ //slow-tick timer, 20 Hz
+
+}
+
+void Aint()
+{
+  boolean Atemp; //temp variable to hold value for rotary encoder A line
+  boolean Btemp; //blahblah
+  boolean zstep; //encoder switch position determines number of motor steps
+  //as rot encoder moves clockwise, values go 0->1->3->2->0...
+  //PIND1 - Int1 - dig pin 20, PIND0 - Int0 - dig pin 21
+  Atemp = PIND0;
+  Btemp = PIND1;
+
+  if(PIND2 == 1) zstep = 1; //if encoder is pushed in, do 10x steps
+  else zstep = 10;
+
+  if(Atemp == 0)
+  {
+    if(Btemp == 0) zchange += zstep;
+    else zchange -= zstep;
   }
-  
-
-    if ((micros() - debugtiming) > debugmaxtime) { debugmaxtime = micros() - debugtiming;}
-  
-}
-
-// joycal functions
-int readjoydata () {
-  xjoycal = readjoy(&xjoypin);
-  yjoycal = readjoy(&yjoypin);
-  joybuttonstate = readbutton(&joybuttonpin);
-  if (xjoycal < 0) { 
-    xjoycal = xjoycal * -1;
-    xjoydir = 0;
-  } else { xjoydir = 1; }
-
-  if (yjoycal < 0) { 
-    yjoycal = yjoycal * -1;
-    yjoydir = 0;
-  } else { yjoydir = 1; }
-  
-  
-}
-
-int calcstepperdelay() {
-  
-  xdelay = long((100-long(xjoycal)) * 900);
-  ydelay = long((100-long(yjoycal)) * 900);
-
-  if (xdelay < xmindelay) { xdelay = xmindelay; }
-  if (xdelay > xmaxdelay) { xdelay = xmaxdelay; }
-
-  if (ydelay < ymindelay) { ydelay = ymindelay; }
-  if (ydelay > ymaxdelay) { ydelay = ymaxdelay; }
-  
-  return true;
-}
-
-int readbutton(int *mypin) {
-  return digitalRead(*mypin);
-}
-
-int readjoy (int *mypin) {
-  int rawvalue = analogRead(*mypin);
-  rawvalue = int((rawvalue-500)/5);
-  
-  if (rawvalue > 97) { rawvalue=100; }
-  if (rawvalue < -97) { rawvalue=-100; }
-  return (rawvalue);
+  else
+  {
+    if(Btemp == 1) zchange += zstep;
+    else zchange -= zstep;
   }
-
-int tweet () {
-  Serial.print(screendata[screendatapos]);
-  screendatapos++;
-  if (screendatapos > 79) { screendatapos = 0; } 
 }
 
-int twitter () {
+void Bint()
+{
+  boolean Atemp; //temp variable to hold value for rotary encoder A line
+  boolean Btemp; //blahblah
+  boolean zstep; //encoder switch position determines number of motor steps
+  //as rot encoder moves clockwise, values go 0->1->3->2->0...
+  //PIND1 - Int1 - dig pin 20, PIND0 - Int0 - dig pin 21
+  Atemp = PIND0;
+  Btemp = PIND1;
 
-  sprintf(screentempbuffer,"X: %03d Y: %03d B:%d",xjoycal,yjoycal,joybuttonstate); // takes 200us!
-  strncpy(screendata+20, screentempbuffer, 17); // takes 16us
+  if(PIND2 == 1) zstep = 1; //if encoder is pushed in, do 10x steps
+  else zstep = 10;
 
-  sprintf(screentempbuffer,"%05d",debugmaxtime);
-  strncpy(screendata, screentempbuffer,5);
-
-  sprintf(screentempbuffer,"Ys:%06d Xs:%06d",ysteps, xsteps);
-  strncpy(screendata+40, screentempbuffer, 20); // takes 16us
-
-//  sprintf(screentempbuffer,"Xd:%06ld Yd:%06ld ",xdelay,ydelay); // takes 200us!
-//  strncpy(screendata+60, screentempbuffer, 20); // takes 16us
-  return true;  
+  if(Btemp == 0)
+  {
+    if(Atemp == 1) zchange += zstep;
+    else zchange -= zstep;
+  }
+  else
+  {
+    if(Atemp == 1) zchange += zstep;
+    else zchange -= zstep;
+  }
 }
+
+
