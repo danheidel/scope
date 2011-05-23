@@ -42,8 +42,8 @@ int preset3led = 13; //PWN T0A
 //note, these picked to not use timers 3&4 since those are being used and
 //altered by the X/Y drive functions
 
-int pushsw = 18;
-int togglesw = -1;
+int pushsw = 58;//analog 4
+int togglesw = 57;//analog 3
 
 int pinxdir=4;
 int pinxstep=5;//PWM T3A
