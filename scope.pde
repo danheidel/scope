@@ -13,23 +13,29 @@ volatile long xpos;
 volatile long ypos;
 volatile long zpos;
 
+//timestamp to help with encoder debouncing
+volatile unsigned long ztimestamp;
 //encoder z-axis state change variable
 volatile int zchange;
 //toggle variable to generate motor drive square wave
 volatile boolean ztoggle;
 
+//keeps track of Int 5A counter match interrupts to implement slow clock
+volatile byte int5ACounter; 
+volatile int int5ACounterSlow;
+
 //pin assignments
-//joystick x
-int xjoypin = 0;//analog 0
 //joystick y
-int yjoypin = 1;//analog 1
+int yjoypin = 0;//analog 0
+//joystick x
+int xjoypin = 1;//analog 1
 //joystick button
 int joybuttonpin = 56;//analog pin 2
 
 //z encoder output A
-int zencpinA = 21;//external int0
+int zencpinA = 20;//external int3
 //z encoder output B
-int zencpinB = 20;//external int1
+int zencpinB = 21;//external int2
 // z encoder push button
 int zencsw = 19;
 
@@ -61,17 +67,19 @@ int ylowlimit = 16;
 int yhighlimit = 17;
 
 //Joystick calibration values
-int xdeadlow = 330;
-int xdeadhigh = 345;
-int xlow = 10;
-int xhigh = 506;
+int xdeadlow = -20;
+int xcenter = 500;
+int xdeadhigh = 20;
+int xlow = 0;
+int xhigh = 990;
 float xlowscale = (float(xdeadlow) - float(xlow))/50.0;
 float xhighscale = (float(xhigh) - float(xdeadhigh))/50.0;
 
-int ydeadlow = 330;
-int ydeadhigh = 345;
-int ylow = 10;
-int yhigh = 506;
+int ydeadlow = -20;
+int ycenter = 510;
+int ydeadhigh = 20;
+int ylow = 1;
+int yhigh = 1000;
 float ylowscale = (float(ydeadlow) - float(ylow))/50.0;
 float yhighscale = (float(yhigh) - float(ydeadhigh))/50.0;
 
@@ -91,9 +99,9 @@ void setup() {
   digitalWrite(joybuttonpin, HIGH); //enable pullup resistor
 
   pinMode(zencpinA, INPUT);
-  digitalWrite(zencpinA, HIGH); //enable pullup resistor
+  //digitalWrite(zencpinA, HIGH); //enable pullup resistor
   pinMode(zencpinB, INPUT);
-  digitalWrite(zencpinB, HIGH); //enable pullup resistor
+  //digitalWrite(zencpinB, HIGH); //enable pullup resistor
   pinMode(zencsw, INPUT);
   digitalWrite(zencsw, HIGH); //enable pullup resistor
 
@@ -137,7 +145,7 @@ void setup() {
   //(COM) - set to toggle OCnA on compare match, (WGM) - set CTC
   axismoveon  = B01000000;
   //TCCRnA - set [7]COMnA1 = 0, [6]COMnA0 = 0, [1]WGMn1 = 0, [0]WGMn0 = 0
-  //(COM) - set to diable OCnA toggle, (WGM) - set CTC
+  //(COM) - set to disable OCnA toggle, (WGM) - set CTC
   axismoveoff = B00000000;
   TCCR3A = axismoveoff; //disable x axis motion by default
   TCCR4A = axismoveoff; //disable y axis motion by default
@@ -160,21 +168,34 @@ void setup() {
   
   TCCR5B = B00001011; //gives decent prediv (/64) range for timer clocks  
   
+  //TIMSK5 - set [1]OCIE5A = 1
+  //(OCIE5a) - activate output compare interrupt for channel A
+  //activate the output compare interrupts to trigger when the OCR5A value is met
+  TIMSK5 = B00000010; 
+  
   cli(); //disable interrupts to safely change 16 bit OCRnx values
-  OCR5A = 63; //gives approx 2 kHz clock rate
-  OCR5B = 6250; //gives approx 20 Hz clock rate
+  OCR5A = 16; //gives approx 8 kHz clock rate
   //renable interrupts
   sei();
   
   //OCRnA values to control PWM rates is set in readjoystick()
 
-  attachInterrupt(0, Aint, CHANGE);
-  attachInterrupt(1, Bint, CHANGE);
+  attachInterrupt(3, Aint, FALLING);
+  //attachInterrupt(3, Bint, CHANGE);
+  
+  Serial.begin(9600);
+  Serial.println("Finished setup");
 }
 
 void loop() 
-{
-
+{/*
+  Serial.print("X: ");
+  Serial.println(xpos);
+  Serial.print("Y: ");
+  Serial.println(ypos);
+  Serial.print("Z: ");
+  Serial.println(zpos);
+  delay(15);*/
 }
 
 void readjoystick()
@@ -187,18 +208,23 @@ void readjoystick()
   joyy = analogRead(yjoypin);
 
   scalemovement(&joyx, &joyy);
+  
+  //Serial.print("xjoy: ");
+  //Serial.println(joyx);
+  //Serial.print("yjoy: ");
+  //Serial.println(joyy);
 
   //if joystick is in dead zone, stop movement
   if (joyx == 0)
     TCCR3A = axismoveoff;
   else TCCR3A = axismoveon;
 
-  if (joyy ==0)
+  if (joyy == 0)
     TCCR4A = axismoveoff;
   else TCCR4A = axismoveon;
 
   //set movement direction, stop movement if at limit switches
-  if(joyx<0)
+  if(joyx < 0)
   {
     digitalWrite(pinxdir, 0);
     if(digitalRead(xlowlimit) == LOW)
@@ -211,7 +237,7 @@ void readjoystick()
       TCCR3A = axismoveoff;
   }
 
-  if(joyy<0)
+  if(joyy < 0)
   {
     digitalWrite(pinydir, 0);
     if(digitalRead(ylowlimit) == LOW)
@@ -236,8 +262,10 @@ void readjoystick()
   sei();
 
   joybuttonpressed = digitalRead(joybuttonpin);
+  //Serial.print("Joyb: ");
+  //Serial.println(joybuttonpressed);
 
-  if(joybuttonpressed == 0)
+  if(joybuttonpressed == 1)
   {
     TCCR3B = axisslowmove;
     TCCR4B = axisslowmove;
@@ -251,31 +279,58 @@ void readjoystick()
 
 void scalemovement(int *joyx, int *joyy)
 { //arbitrary mapping of joystick input values to ranked value ranks
-  if(*joyx < xdeadlow)
+  //Serial.print("x: ");
+  //Serial.print(*joyx);
+  
+  *joyx -= xcenter;
+  //Serial.print(" ");
+  //Serial.print(*joyx);
+  
+  if(*joyx <= xdeadlow)
   {
     *joyx -= xdeadlow;
-    *joyx /= xlowscale;
+    //*joyx /= xlowscale;
+    *joyx /= 5;
   }  
+  
   if((*joyx > xdeadlow)&&(*joyx < xdeadhigh))
     *joyx = 0;
-  if(*joyx > xdeadhigh)
+    
+  if(*joyx >= xdeadhigh)
   {
     *joyx -= xdeadhigh;
-    *joyx /= xhighscale;
+    //*joyx /= xhighscale;
+    *joyx /= 5;
   }
+  
+  *joyx = 0 - *joyx;
+  //Serial.print(" ");
+  //Serial.println(*joyx);
 
-  if(*joyy < ydeadlow)
+  //Serial.print("y: ");
+  //Serial.print(*joyy);
+  *joyy -= ycenter;
+  //Serial.print(" ");
+  //Serial.print(*joyy);
+  
+  if(*joyy <= ydeadlow)
   {
     *joyy -= ydeadlow;
-    *joyy /= ylowscale;
+    //*joyy /= ylowscale;
+    *joyy /= 5;
   }  
+  
   if((*joyy > ydeadlow)&&(*joyy < ydeadhigh))
     *joyy = 0;
-  if(*joyy > ydeadhigh)
+    
+  if(*joyy >= ydeadhigh)
   {
     *joyy -= ydeadhigh;
-    *joyy /= yhighscale;
+    //*joyy /= yhighscale;
+    *joyy /= 5;
   }
+  //Serial.print(" ");
+  //Serial.println(*joyy);
 }
 
 int scalePWM(int rank)
@@ -283,7 +338,7 @@ int scalePWM(int rank)
   return 32768/abs(rank);
 }
 
-ISR(TIM3_COMPA)
+ISR(TIMER3_COMPA_vect)
 { //x-axis tally
   if(PINE3) //if x-step has gone high
   {
@@ -294,7 +349,7 @@ ISR(TIM3_COMPA)
   }
 }
 
-ISR(TIM4_COMPA)
+ISR(TIMER4_COMPA_vect)
 { //y-axis tally
   if(PINH3) //if y-step has gone high
   {
@@ -305,8 +360,28 @@ ISR(TIM4_COMPA)
   }
 }
 
-ISR(TIM5_COMPA)
-{ //fast-tick timer, 2 kHz
+ISR(TIMER5_COMPA_vect)
+{ //fast-tick timer, 8 kHz
+  //Serial.println("fast tick");
+  
+  //increment int5ACounter
+  //this fires approx 40 Hz
+  int5ACounter++;
+  if(int5ACounter > 200)
+  { //slow counter runs at 1/200th speed of fast counter
+    //Serial.println("slow tick");
+    readjoystick();
+    int5ACounter = 0;
+  }
+  
+  int5ACounterSlow++;
+  if(int5ACounterSlow > 8000)
+  {
+    //extra slow counter fires ~1Hz
+    Serial.println();
+    int5ACounterSlow = 0;
+  }
+  
   if(ztoggle == 0)
   {
     ztoggle = 1;
@@ -330,43 +405,78 @@ ISR(TIM5_COMPA)
   {
     PORTE = PORTE&B11011111; //falling edge to step line E5
   }
-}
-
-ISR(TIM5_COMPB)
-{ //slow-tick timer, 20 Hz
-
+  //Serial.println("fast tick");
 }
 
 void Aint()
 {
-  boolean Atemp; //temp variable to hold value for rotary encoder A line
-  boolean Btemp; //blahblah
-  boolean zstep; //encoder switch position determines number of motor steps
+  //wait at least 100 milliseconds betweeen encoder clicks, bad debounce issue
+  if(ztimestamp - millis() < 100) 
+  {
+    Serial.println("debounce");
+    ztimestamp = millis();
+    return;
+  }
+  
+  volatile char Areg = 0; //temp var to hold Pin D-bank values
+  volatile byte Atemp = 0; //temp variable to hold value for rotary encoder A line
+  volatile byte Btemp = 0; //blahblah
+  volatile byte zstep = 0; //encoder switch position determines number of motor steps
   //as rot encoder moves clockwise, values go 0->1->3->2->0...
   //PIND1 - Int1 - dig pin 20, PIND0 - Int0 - dig pin 21
-  Atemp = PIND0;
-  Btemp = PIND1;
+  Areg = PIND;
+  //Atemp = PIND0;
+  Atemp = Areg&B00000001;
+  //Btemp = PIND1;
+  Btemp = Areg&B00000010;
 
   if(PIND2 == 1) zstep = 1; //if encoder is pushed in, do 10x steps
   else zstep = 10;
 
+  //Serial.println(Areg, BIN);
+  //Serial.println(Atemp, BIN);
+  //Serial.println(Btemp, BIN);
+  //Serial.println("Aint");
+  Serial.print("zmillis: ");
+  Serial.println(ztimestamp, DEC);
+  Serial.print("millis: ");
+  Serial.println(millis(), DEC);
+  
   if(Atemp == 0)
   {
-    if(Btemp == 0) zchange += zstep;
-    else zchange -= zstep;
+    if(Btemp == 0) 
+    {
+       zchange += zstep;
+       Serial.println("Z+");
+    }
+    else 
+    {
+      zchange -= zstep;
+      Serial.println("Z-");
+    }
   }
   else
   {
-    if(Btemp == 1) zchange += zstep;
-    else zchange -= zstep;
+    if(Btemp == 1) 
+    {
+       zchange += zstep;
+       Serial.println("Z+");
+    }
+    else 
+    {
+       zchange -= zstep;
+       Serial.println("Z-");
+    }
   }
+  
+  ztimestamp = millis();
 }
 
 void Bint()
 {
-  boolean Atemp; //temp variable to hold value for rotary encoder A line
-  boolean Btemp; //blahblah
-  boolean zstep; //encoder switch position determines number of motor steps
+  volatile boolean Atemp; //temp variable to hold value for rotary encoder A line
+  volatile boolean Btemp; //blahblah
+  volatile boolean zstep; //encoder switch position determines number of motor steps
   //as rot encoder moves clockwise, values go 0->1->3->2->0...
   //PIND1 - Int1 - dig pin 20, PIND0 - Int0 - dig pin 21
   Atemp = PIND0;
@@ -374,16 +484,34 @@ void Bint()
 
   if(PIND2 == 1) zstep = 1; //if encoder is pushed in, do 10x steps
   else zstep = 10;
+  
+  Serial.println("Bint");
 
   if(Btemp == 0)
   {
-    if(Atemp == 1) zchange += zstep;
-    else zchange -= zstep;
+    if(Atemp == 1) 
+    {
+       zchange += zstep;
+       Serial.println("Z+");
+    }
+    else 
+    {
+       zchange -= zstep;
+       Serial.println("Z-");
+    }
   }
   else
   {
-    if(Atemp == 1) zchange += zstep;
-    else zchange -= zstep;
+    if(Atemp == 1) 
+    {
+       zchange += zstep;
+       Serial.println("Z+");
+    }
+    else 
+    {
+       zchange -= zstep;
+       Serial.println("Z-");
+    }
   }
 }
 
